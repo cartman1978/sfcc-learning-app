@@ -1361,6 +1361,1250 @@ if (loyaltyEnabled) {
         ]
       }
     ]
+  },
+
+  // ── MODULE 8 ─────────────────────────────────────────────────────────────
+  {
+    id: "web-services-integrations",
+    title: "Web Services & Integrations",
+    icon: "🔌",
+    color: "#7c3aed",
+    type: "b2c",
+    description: "The Service Framework: HTTP, SOAP, FTP integrations, circuit breakers, rate limiting, and logging.",
+    lessons: [
+      {
+        id: "service-framework",
+        title: "Service Framework Architecture",
+        duration: "10 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "The B2C Commerce <strong>Service Framework</strong> is the official way to make outbound calls to external systems (payment gateways, ERPs, PIM systems, etc.). It manages call execution, monitors performance, and enforces configurable rate and circuit-breaker limits. Never use raw <code>dw.net.HTTPClient</code> directly outside the framework." },
+          { type: "heading", text: "Three Required Configurations" },
+          { type: "p", text: "Every service needs three Business Manager records: <strong>Service Configuration</strong> (references credential + profile, generates the <code>ServiceConfig</code> object), <strong>Service Credential</strong> (stores URL, username, password for basic auth), and <strong>Service Profile</strong> (timeout, circuit-breaker thresholds, rate limits). Naming convention for credentials: <code>http.mysite.myservice.cred</code> — no spaces." },
+          { type: "callout", callout: "info", title: "Service Types", text: "HTTP, HTTP Form, FTP, SFTP, SOAP, and Generic. HTTP uses dw.net.HTTPClient. SOAP uses webreferences2/ folder with .wsdl files. Generic lets you implement any protocol manually." },
+          { type: "heading", text: "Callback Execution Order" },
+          { type: "p", text: "When you call <code>service.call()</code>, the framework runs callbacks in a fixed sequence: <code>initServiceClient()</code> (SOAP only — creates the port), <code>createRequest()</code> (set headers, body, params), <code>execute()</code> (performs the actual call), <code>parseResponse()</code> (converts raw response to your return object). The framework checks rate limits and circuit-breaker state before executing." },
+          { type: "heading", text: "Circuit Breaker & Rate Limiter" },
+          { type: "p", text: "The <strong>circuit breaker</strong> suspends calls when failure thresholds are reached within a configured interval. Triggers include: unknown host, connection timeout, connection refused, HTTP 500/503, and explicitly thrown exceptions. Note: HTTP 4xx errors do NOT trip the circuit breaker. The <strong>rate limiter</strong> allows a maximum number of calls per time interval; exceeding it throws <code>ServiceUnavailableException</code>." },
+          { type: "callout", callout: "warning", title: "Timeout Trap", text: "Default timeouts are 2 minutes (storefront) and 15 minutes (jobs). A 5-second timeout does NOT mean the call finishes in 5 seconds — it means no single operation exceeds 5 seconds. A connection (4s) + two reads (4s each) = 13 seconds total without triggering the timeout." },
+        ],
+        code: [
+          {
+            title: "Creating an HTTP service with LocalServiceRegistry",
+            lang: "javascript",
+            code: `'use strict';
+
+var LocalServiceRegistry = require('dw/svc/LocalServiceRegistry');
+
+/**
+ * Creates a reusable service instance.
+ * The service config name must match what's defined in Business Manager
+ * under Administration > Operations > Services > Service Configurations.
+ */
+function getLoyaltyService() {
+    return LocalServiceRegistry.createService('http.loyalty.api', {
+
+        // Step 1: build the request
+        createRequest: function (svc, params) {
+            svc.addHeader('Content-Type', 'application/json');
+            svc.addHeader('X-API-Key', svc.configuration.credential.password);
+            svc.setRequestMethod('POST');
+            // URL from credential + path suffix
+            svc.setURL(svc.configuration.credential.URL + '/v1/points');
+            return JSON.stringify(params);
+        },
+
+        // Step 2: parse the response into a plain object
+        parseResponse: function (svc, httpClient) {
+            return JSON.parse(httpClient.text);
+        },
+
+        // Optional: override error message
+        filterLogMessage: function (msg) {
+            // Mask API keys in logs
+            return msg.replace(/X-API-Key: [^\\n]+/, 'X-API-Key: [REDACTED]');
+        }
+    });
+}
+
+// Usage in a controller or job step
+function awardPoints(customerId, points) {
+    var svc = getLoyaltyService();
+    var result = svc.call({ customerId: customerId, points: points });
+
+    if (result.ok) {
+        return result.object; // parsed JSON from parseResponse()
+    }
+    var Logger = require('dw/system/Logger');
+    Logger.getLogger('loyalty').error('Service call failed: {0}', result.errorMessage);
+    return null;
+}`,
+            explanation: "LocalServiceRegistry.createService() wires your callbacks into the framework. result.ok is true on HTTP 2xx. result.object is what parseResponse() returns."
+          },
+          {
+            title: "SOAP service setup (webreferences2 folder)",
+            lang: "text",
+            code: `cartridge/
+└── webreferences2/
+    ├── TaxService.wsdl          ← WSDL definition
+    ├── TaxService.jks           ← optional: WS-Security keystore
+    └── TaxService.wsdl.properties  ← optional: namespace collision fixes
+
+// In your service callback object, add initServiceClient():
+initServiceClient: function(svc) {
+    // The framework generates stub classes from the WSDL
+    // Access via svc.serviceClient (the port object)
+    var port = svc.serviceClient.getCalculateTaxPort();
+    svc.serviceClient = port;
+},
+
+createRequest: function(svc, params) {
+    // Build SOAP request object using generated stubs
+    var request = new webreferences2.TaxService.CalculateRequest();
+    request.setOrderId(params.orderId);
+    return request;
+}`,
+            explanation: "WSDL files go in webreferences2/. The framework generates Java/JS stub classes. Run the pipeline to regenerate stubs after WSDL changes before deploying to production."
+          },
+          {
+            title: "Service logging & monitoring",
+            lang: "text",
+            code: `// Log file naming pattern:
+service-<prefix>-<internalID>-<date>.log
+
+// Log category hierarchy:
+services.<type>.<cartridge>.<service>.<operation>.<message_type>
+
+// message_type values:
+//   head  → success/failure summary after each call
+//   comm  → full request+response payload (enable at INFO level)
+//   log   → init traces, misc messages
+
+// Monitor real-time in Business Manager:
+// Administration > Operations > Service Status
+// Shows trends, per-service drilldown, 10 days retention
+
+// Enable comm logging for a service (Business Manager):
+// Service Configurations > [service] > Log Level > INFO`,
+            explanation: "comm-level logging captures full request/response payloads — useful for debugging but should be disabled in production to avoid logging sensitive data."
+          }
+        ],
+        quiz: [
+          {
+            q: "What are the three required Business Manager records for every web service?",
+            options: [
+              "Service URL, Service Token, Service Timeout",
+              "Service Configuration, Service Credential, Service Profile",
+              "Service Definition, Service Policy, Service Endpoint",
+              "Service Name, Service Secret, Service Rate"
+            ],
+            correct: 1,
+            explanation: "Every service needs: Service Credential (URL/user/pass), Service Profile (timeouts/rate limits/circuit breaker), and Service Configuration (links credential + profile together)."
+          },
+          {
+            q: "Which HTTP status codes trigger the circuit breaker?",
+            options: [
+              "All HTTP errors including 4xx and 5xx",
+              "Only HTTP 500 and 503, plus connection-level failures",
+              "Only connection timeouts",
+              "HTTP 400, 404, and 500"
+            ],
+            correct: 1,
+            explanation: "The circuit breaker trips on connection-level failures (timeout, refused, unknown host) and HTTP 500/503. HTTP 4xx errors (bad request, not found) are treated as application errors, not service failures."
+          },
+          {
+            q: "Where do WSDL files for SOAP services go in a cartridge?",
+            options: [
+              "cartridge/scripts/webservices/",
+              "cartridge/webreferences2/",
+              "cartridge/services/soap/",
+              "cartridge/lib/wsdl/"
+            ],
+            correct: 1,
+            explanation: "SOAP WSDL files (and optional .jks keystores and .wsdl.properties) go in cartridge/webreferences2/. The framework generates stub classes from these files."
+          },
+          {
+            q: "What does filterLogMessage() do in a service callback?",
+            options: [
+              "Filters which log level to use",
+              "Masks sensitive data in log output before it is written",
+              "Disables logging for that service",
+              "Filters which HTTP methods get logged"
+            ],
+            correct: 1,
+            explanation: "filterLogMessage() intercepts log output and lets you redact sensitive data (API keys, passwords, PII) before it's written to the log file."
+          }
+        ]
+      }
+    ]
+  },
+
+  // ── MODULE 9 ─────────────────────────────────────────────────────────────
+  {
+    id: "caching-performance",
+    title: "Caching & Performance",
+    icon: "⚡",
+    color: "#d97706",
+    type: "b2c",
+    description: "Server-side caching, custom caches, CDN strategy, performance budgets, and the code profiler.",
+    lessons: [
+      {
+        id: "response-caching",
+        title: "Response Caching & CDN Strategy",
+        duration: "9 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "B2C Commerce uses <strong>Fastly</strong> as its CDN. Controllers emit cache headers via SFRA middleware functions that tell Fastly how long to cache a response. Getting caching right is the single highest-leverage performance optimisation available — a cache hit eliminates ALL server-side execution." },
+          { type: "heading", text: "Cache Middleware in SFRA" },
+          { type: "p", text: "<code>cache.applyDefaultCache</code> sets a standard TTL appropriate for most category/product pages. <code>cache.applyPromotionSensitiveCache</code> uses a shorter TTL (or no cache) when active promotions could change the displayed price. <code>cache.applyShortPromotionSensitiveCache</code> is for pages that must reflect promotions within minutes." },
+          { type: "callout", callout: "warning", title: "Personalised Responses", text: "Never cache personalised content (customer name, basket count, loyalty tier) at the CDN level. Use remote includes (<iscomponent>) or client-side AJAX fetches for those fragments, and cache the static shell." },
+          { type: "heading", text: "Custom Caches" },
+          { type: "p", text: "Custom caches (via <code>dw.system.CacheMgr</code>) store expensive-to-calculate data in application-server memory. Total budget is ~20 MB across all custom caches per application server. Maximum 128 KB per cache entry. Up to 100 caches per code version. Caches are per-server and not synchronised across the cluster." },
+          { type: "callout", callout: "info", title: "Cache Invalidation", text: "Custom caches are cleared on code deployment, data replication, and code replication. There is no guarantee an entry survives — always code the loader function as a fallback." },
+          { type: "heading", text: "Performance Budget" },
+          { type: "p", text: "Shopper APIs must respond in under <strong>10 seconds</strong> or a HTTP 504 is returned and the transaction fails. Responsibility is shared: Salesforce owns API code reliability; you own catalog quality, request parameters, and custom code performance. Use the <code>select</code> parameter to request only needed properties and avoid unnecessary expansions that reduce cache effectiveness." },
+        ],
+        code: [
+          {
+            title: "SFRA cache middleware patterns",
+            lang: "javascript",
+            code: `'use strict';
+
+var server = require('server');
+var cache = require('*/cartridge/scripts/middleware/cache');
+
+// Standard product page — cache for default TTL (hours)
+server.get('Show', cache.applyDefaultCache, function (req, res, next) {
+    // This response will be cached by Fastly
+    res.render('product/productDetails', { /* ... */ });
+    return next();
+});
+
+// Promotion-sensitive page — shorter TTL
+server.get('Category', cache.applyPromotionSensitiveCache, function (req, res, next) {
+    res.render('search/searchResults', { /* ... */ });
+    return next();
+});
+
+// Never cache: account pages, cart, checkout
+server.get('Account',
+    server.middleware.https,
+    userLoggedIn.validateLoggedIn,
+    // No cache middleware — always live
+    function (req, res, next) {
+        res.render('account/accountDashboard', { /* ... */ });
+        return next();
+    }
+);`,
+            explanation: "Cache middleware must come before your handler in the middleware chain. Never apply cache middleware to authenticated or personalised routes."
+          },
+          {
+            title: "Custom Cache with CacheMgr",
+            lang: "javascript",
+            code: `'use strict';
+
+var CacheMgr = require('dw/system/CacheMgr');
+
+// Cache definition lives in cartridge/cache/customCaches.json:
+// { "caches": [{ "id": "loyaltyTiers", "expirationSeconds": 3600 }] }
+
+function getLoyaltyTiers() {
+    // getCache() retrieves the cache by its config ID
+    var cache = CacheMgr.getCache('loyaltyTiers');
+
+    // cache.get(key, loader) — returns cached value or calls loader
+    var tiers = cache.get('all', function () {
+        // This loader only runs on a cache miss
+        var svc = require('*/cartridge/scripts/services/loyaltyService');
+        var result = svc.call();
+        if (result.ok) {
+            return result.object.tiers; // must be < 128 KB
+        }
+        return null; // null is stored; undefined is rejected
+    });
+
+    return tiers;
+}
+
+// Invalidate a specific key on an application server
+function invalidateTiersOnThisServer() {
+    var cache = CacheMgr.getCache('loyaltyTiers');
+    cache.invalidate('all'); // only clears on THIS app server
+}`,
+            explanation: "cache.get(key, loader) is the atomic get-or-load pattern. The loader runs only on cache miss. Remember: 20 MB total, 128 KB per entry, per-server only."
+          },
+          {
+            title: "Avoiding the expansion performance trap (SCAPI)",
+            lang: "javascript",
+            code: `// BAD — retrieves all expansions, large response, poor cache hit rate
+const product = await shopperProducts.getProduct({
+    parameters: { id: '123', expand: ['availability','promotions','options','images','prices'] }
+});
+
+// GOOD — only what the PDP actually needs, smaller response, better caching
+const product = await shopperProducts.getProduct({
+    parameters: {
+        id: '123',
+        expand: ['images', 'prices'],
+        // select only the fields you render
+        select: '(id,name,price,images.(link,alt),c_badge)'
+    }
+});
+
+// Availability caches for only 60 seconds — don't include it
+// on pages that don't display stock messaging
+// Promotions similarly reduce cache TTL significantly`,
+            explanation: "Every expansion adds response size and reduces cache effectiveness. availability and promotions have very short cache TTLs — only request them where shown."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is the maximum memory budget for all custom caches combined on one application server?",
+            options: ["128 MB", "1 GB", "~20 MB", "512 KB"],
+            correct: 2,
+            explanation: "~20 MB is reserved for all custom caches on each application server. Maximum per-entry size is 128 KB. Caches are not shared across servers in the cluster."
+          },
+          {
+            q: "What happens when a Shopper API call takes longer than 10 seconds?",
+            options: [
+              "The response is queued and retried",
+              "A HTTP 504 timeout is returned and the transaction fails",
+              "The request continues in the background",
+              "A warning is logged but the response still arrives"
+            ],
+            correct: 1,
+            explanation: "Shopper APIs must respond in under 10 seconds. Exceeding this returns HTTP 504 and the transaction fails — the customer cannot complete their action."
+          },
+          {
+            q: "Why should you avoid the 'availability' expansion on most cached pages?",
+            options: [
+              "It increases response size by 10x",
+              "Availability data caches for only 60 seconds, drastically reducing CDN cache hit rates",
+              "It requires an extra database query per product",
+              "It is deprecated in SCAPI"
+            ],
+            correct: 1,
+            explanation: "The availability expansion has a cache TTL of only 60 seconds. Including it on pages that cache for hours means those pages effectively bypass CDN caching."
+          },
+          {
+            q: "Custom cache invalidate() only clears the entry on one server. Why does this matter?",
+            options: [
+              "It doesn't matter — caches synchronise within 5 seconds",
+              "Other app servers in the cluster keep stale data until their entries expire or are cleared separately",
+              "invalidate() fails silently if called on a different server",
+              "It triggers a full cache flush on all servers"
+            ],
+            correct: 1,
+            explanation: "Custom caches are per-application-server and are NOT synchronised across the cluster. invalidate() only clears on the server where the call executes. Design your cache TTLs accordingly."
+          }
+        ]
+      }
+    ]
+  },
+
+  // ── MODULE 10 ─────────────────────────────────────────────────────────────
+  {
+    id: "promotions-campaigns",
+    title: "Promotions & Campaigns",
+    icon: "🏷️",
+    color: "#dc2626",
+    type: "b2c",
+    description: "Campaign structure, promotion types, qualifiers, coupons, and reading promotions in code.",
+    lessons: [
+      {
+        id: "promotions-overview",
+        title: "Campaign & Promotion Structure",
+        duration: "9 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "Promotions in B2C Commerce are organised in a hierarchy: <strong>Campaign → Experience → Promotion</strong>. A <strong>Campaign</strong> is a container with a date range and an assigned customer group or source code. <strong>Experiences</strong> are segments within a campaign (e.g. 'VIP Email Blast'). <strong>Promotions</strong> are the actual discount rules attached to an experience." },
+          { type: "heading", text: "Promotion Types" },
+          { type: "p", text: "<strong>Product promotions</strong> discount specific products or categories (e.g. 20% off all footwear). <strong>Order promotions</strong> discount the entire order total (e.g. $10 off orders over $75). <strong>Shipping promotions</strong> discount or waive shipping costs. Each type has its own qualifier conditions and discount configuration." },
+          { type: "callout", callout: "info", title: "Promotion Exclusivity", text: "Promotions can be set to Exclusive (only one applies), Class-exclusive (only one per class applies), or Non-exclusive (all matching promotions stack). Exclusive promotions are evaluated first; the highest-value one wins." },
+          { type: "heading", text: "Qualifiers" },
+          { type: "p", text: "A qualifier defines the condition a basket must meet for a promotion to fire: a minimum order amount, a specific product in the basket, a coupon code entry, a customer group membership, or a source code parameter in the URL. Multiple qualifiers can be combined with AND/OR logic." },
+          { type: "callout", callout: "warning", title: "Performance Impact", text: "Complex promotions with many qualifiers significantly slow down basket recalculation. Every add-to-cart, quantity change, and coupon entry triggers a full promotion evaluation. Coordinate with merchandising to keep promotion rules lean." },
+          { type: "heading", text: "Coupons" },
+          { type: "p", text: "Coupons are standalone codes linked to a promotion via a coupon qualifier. They can be <strong>single-use</strong> (one redemption total), <strong>single-use per customer</strong>, or <strong>multi-use</strong>. Coupon codes can be imported in bulk via the Data API or Business Manager import." },
+          { type: "heading", text: "Reading Promotions in Code" },
+          { type: "p", text: "Use <code>dw.campaign.PromotionMgr</code> to retrieve active promotions for a product or basket. The <code>getActivePromotions()</code> method returns all currently applicable promotions. <code>getProductPromotions(product)</code> returns promotions that could fire for a specific product." },
+        ],
+        code: [
+          {
+            title: "Reading active promotions for a product",
+            lang: "javascript",
+            code: `'use strict';
+
+var PromotionMgr = require('dw/campaign/PromotionMgr');
+var ProductMgr = require('dw/catalog/ProductMgr');
+
+function getProductBadges(pid) {
+    var product = ProductMgr.getProduct(pid);
+    if (!product) return [];
+
+    // Get all promotions currently applicable to this product
+    var promotions = PromotionMgr.getActivePromotions().getProductPromotions(product);
+
+    var badges = [];
+    var promotionIterator = promotions.iterator();
+
+    while (promotionIterator.hasNext()) {
+        var promo = promotionIterator.next();
+
+        badges.push({
+            id: promo.ID,
+            name: promo.name,
+            calloutMsg: promo.calloutMsg ? promo.calloutMsg.markup : null,
+            rank: promo.rank
+        });
+    }
+
+    // Sort by rank (lower rank = higher priority)
+    return badges.sort(function (a, b) { return a.rank - b.rank; });
+}`,
+            explanation: "PromotionMgr.getActivePromotions() is context-aware — it checks the current date, customer group, and source codes. Always call it at request time, not during job execution."
+          },
+          {
+            title: "Applying a coupon to a basket",
+            lang: "javascript",
+            code: `'use strict';
+
+var BasketMgr = require('dw/order/BasketMgr');
+var Transaction = require('dw/system/Transaction');
+
+server.post('AddCoupon', server.middleware.https, function (req, res, next) {
+    var couponCode = req.form.couponCode.trim().toUpperCase();
+    var currentBasket = BasketMgr.getCurrentBasket();
+
+    if (!currentBasket) {
+        res.json({ error: true, errorMessage: 'No active basket' });
+        return next();
+    }
+
+    // Validate coupon exists and is applicable
+    var couponLineItem;
+    Transaction.wrap(function () {
+        couponLineItem = currentBasket.createCouponLineItem(couponCode, true);
+    });
+
+    if (!couponLineItem || !couponLineItem.applied) {
+        res.json({
+            error: true,
+            errorMessage: 'Coupon code is invalid or has already been used.'
+        });
+        return next();
+    }
+
+    res.json({
+        success: true,
+        discount: couponLineItem.priceAdjustments
+            .toArray()
+            .reduce(function (sum, pa) { return sum + pa.price; }, 0)
+    });
+
+    return next();
+});`,
+            explanation: "createCouponLineItem(code, true) adds the coupon and triggers promotion recalculation. The second param (true) means merge with existing coupons. Check couponLineItem.applied to confirm it fired."
+          },
+          {
+            title: "Promotion callout messages in ISML",
+            lang: "xml",
+            code: `<!--- Display promotion badge on product tile --->
+<isif condition="\${pdict.product.promotions && pdict.product.promotions.length > 0}">
+    <div class="promotion-badges">
+        <isloop items="\${pdict.product.promotions}" var="promo">
+            <isif condition="\${promo.calloutMsg}">
+                <span class="promo-badge">
+                    <!--- calloutMsg.markup is pre-rendered HTML from BM --->
+                    <isprint value="\${promo.calloutMsg.markup}" encoding="off"/>
+                </span>
+            </isif>
+        </isloop>
+    </div>
+</isif>`,
+            explanation: "promo.calloutMsg.markup comes from the Callout Message field in Business Manager. Use encoding='off' because BM stores it as HTML — but only expose it if set by your own merchandisers."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is the correct hierarchy of B2C Commerce promotions?",
+            options: [
+              "Promotion → Campaign → Experience",
+              "Campaign → Experience → Promotion",
+              "Experience → Promotion → Campaign",
+              "Campaign → Promotion → Coupon"
+            ],
+            correct: 1,
+            explanation: "The hierarchy is Campaign (date range, customer group) → Experience (segment within campaign) → Promotion (the actual discount rule). A campaign can have multiple experiences, each with multiple promotions."
+          },
+          {
+            q: "What does setting a promotion to 'Exclusive' mean?",
+            options: [
+              "It applies to exclusive (VIP) customers only",
+              "Only one exclusive promotion can apply — the highest-value one wins",
+              "It cannot be combined with coupons",
+              "It runs before all non-exclusive promotions but stacks with them"
+            ],
+            correct: 1,
+            explanation: "An Exclusive promotion means only one promotion with that exclusivity class can apply. When multiple exclusive promotions match, the highest-value one is applied and the rest are ignored."
+          },
+          {
+            q: "Why do complex promotion rules hurt performance?",
+            options: [
+              "They require more database storage",
+              "Every basket mutation (add to cart, qty change, coupon entry) triggers a full promotion re-evaluation",
+              "They disable CDN caching for the entire site",
+              "They require a separate microservice call"
+            ],
+            correct: 1,
+            explanation: "Promotion evaluation runs synchronously on every basket change. With many complex promotions and qualifiers, this recalculation becomes the slowest part of add-to-cart and checkout flows."
+          },
+          {
+            q: "What does createCouponLineItem(code, true) return if the coupon is invalid?",
+            options: [
+              "It throws a CouponException",
+              "It returns a couponLineItem where couponLineItem.applied is false",
+              "It returns null",
+              "It returns an error code string"
+            ],
+            correct: 1,
+            explanation: "createCouponLineItem() always returns a line item object but you must check .applied to confirm the coupon actually fired. An invalid or expired coupon creates the line item but does not apply a discount."
+          }
+        ]
+      }
+    ]
+  },
+
+  // ── MODULE 11 ─────────────────────────────────────────────────────────────
+  {
+    id: "search-content",
+    title: "Search, Content & Page Designer",
+    icon: "🔍",
+    color: "#0891b2",
+    type: "b2c",
+    description: "Product search, search refinements, Einstein search, content assets, and Page Designer components.",
+    lessons: [
+      {
+        id: "product-search",
+        title: "Product Search & Refinements",
+        duration: "9 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "B2C Commerce uses a built-in search engine (Elasticsearch-backed) configured entirely in Business Manager. No direct Elasticsearch access is provided — all configuration is done through the search index settings, search refinements, sorting rules, and search tuning tools in BM." },
+          { type: "heading", text: "Search Index" },
+          { type: "p", text: "Products are indexed automatically on a schedule or manually via <strong>Administration > Search > Search Indexes</strong>. The index captures product attributes, categories, prices, inventory, and custom attributes. Only attributes marked as <strong>searchable</strong> or <strong>used in search refinement</strong> in the System Object Type definition are indexed." },
+          { type: "callout", callout: "info", title: "Index Rebuild Time", text: "Full index rebuilds can take minutes on large catalogs. Use delta index updates (only changed products) for frequent updates. Rebuilds are triggered by catalog imports and can be scheduled as a job step using the built-in SearchIndex step type." },
+          { type: "heading", text: "Search Refinements" },
+          { type: "p", text: "Refinements are the filter facets shown on search results and category pages (size, color, price range, brand). They are configured per-category in Business Manager. There are three types: <strong>attribute refinements</strong> (product attribute values), <strong>category refinements</strong> (sub-category drill-down), and <strong>price refinements</strong> (price range buckets)." },
+          { type: "heading", text: "ProductSearchModel in Code" },
+          { type: "p", text: "The <code>dw.catalog.ProductSearchModel</code> API executes search queries programmatically. You set the search phrase, category, refinement values, sorting rule, and pagination, then call <code>search()</code> to execute. The model returns a <code>ProductSearchResult</code> with hits, refinements, and pagination data." },
+          { type: "callout", callout: "tip", title: "Einstein Search", text: "Einstein Search (available as an add-on) replaces the keyword ranking algorithm with ML-based personalised ranking. It also powers Search Suggestions (SAYT — Search As You Type) with instant results. No code changes are needed to enable it — it's configured in BM." },
+        ],
+        code: [
+          {
+            title: "ProductSearchModel — programmatic search",
+            lang: "javascript",
+            code: `'use strict';
+
+var ProductSearchModel = require('dw/catalog/ProductSearchModel');
+var CatalogMgr = require('dw/catalog/CatalogMgr');
+var URLUtils = require('dw/web/URLUtils');
+
+function executeSearch(params) {
+    var apiProductSearch = new ProductSearchModel();
+
+    // Set search phrase (keyword)
+    if (params.q) {
+        apiProductSearch.setSearchPhrase(params.q);
+    }
+
+    // Set category context
+    if (params.cgid) {
+        var category = CatalogMgr.getCategory(params.cgid);
+        if (category && category.online) {
+            apiProductSearch.setCategoryID(params.cgid);
+        }
+    }
+
+    // Apply refinement values (e.g. color=blue&size=M)
+    if (params.prefn1 && params.prefv1) {
+        apiProductSearch.addRefinementValues(params.prefn1, params.prefv1);
+    }
+
+    // Sorting rule (configured in BM under Sorting Rules)
+    if (params.srule) {
+        apiProductSearch.setSortingRuleID(params.srule);
+    }
+
+    // Pagination
+    var pageSize = 24;
+    var start = params.start ? parseInt(params.start, 10) : 0;
+    apiProductSearch.setPageSize(pageSize);
+    apiProductSearch.setPageNumber(Math.floor(start / pageSize));
+
+    // Execute the search
+    apiProductSearch.search();
+
+    return {
+        productIds: apiProductSearch.getProductIDs().toArray(),
+        count: apiProductSearch.getCount(),
+        refinements: apiProductSearch.getRefinements(),
+        currentSortingRule: apiProductSearch.getSortingRule()
+    };
+}`,
+            explanation: "ProductSearchModel builds a query incrementally. Always call search() before accessing results. Refinement params follow the convention prefn1/prefv1, prefn2/prefv2, etc."
+          },
+          {
+            title: "Rebuilding the search index as a job step",
+            lang: "json",
+            code: `// Business Manager: Administration > Operations > Jobs
+// Add a job step of type: sitegenesis.search.SearchIndex
+// (or use the built-in SearchIndex step)
+
+// Job step parameters:
+{
+  "IndexType": "ProductIndex",    // ProductIndex | ContentIndex
+  "Mode": "Full",                 // Full | Delta
+  "SiteName": "RefArch",
+  "Locale": "default"
+}
+
+// Recommended job schedule:
+// Full rebuild: nightly (off-peak hours)
+// Delta update: every 15 minutes during business hours`,
+            explanation: "Full rebuilds are expensive — schedule them nightly. Delta updates only re-index changed products and run much faster, keeping search results fresh throughout the day."
+          }
+        ],
+        quiz: [
+          {
+            q: "Which Business Manager area configures search refinements (filter facets)?",
+            options: [
+              "Merchant Tools > Search > Refinements",
+              "Category management — per-category refinement configuration under the category settings",
+              "Administration > Search > Refinements",
+              "Merchant Tools > Products > Attributes"
+            ],
+            correct: 1,
+            explanation: "Search refinements are configured per-category in the category management area of Merchant Tools. Each category can have its own set of attribute, category, and price refinements."
+          },
+          {
+            q: "What must be done before a product attribute appears as a search refinement?",
+            options: [
+              "The attribute must be added to the catalog XML",
+              "The attribute must be marked 'used in search refinement' in System Object Types and the index rebuilt",
+              "The attribute must have a display name in all locales",
+              "The attribute must be set to required"
+            ],
+            correct: 1,
+            explanation: "Attributes must be flagged as searchable or used-in-refinement in System Object Type definitions. After that, a search index rebuild is required before the attribute appears in refinements."
+          },
+          {
+            q: "What is a delta index update vs a full index rebuild?",
+            options: [
+              "Delta updates only index new products; full rebuilds index all products",
+              "Delta updates only re-index products changed since the last build; full rebuilds re-index everything",
+              "They are the same — 'delta' is just a faster rebuild mode",
+              "Delta updates require a SCAPI call; full rebuilds use Business Manager"
+            ],
+            correct: 1,
+            explanation: "Delta updates re-index only changed products, making them much faster and suitable for frequent scheduling. Full rebuilds re-index the entire catalog and are typically scheduled nightly."
+          }
+        ]
+      },
+      {
+        id: "page-designer",
+        title: "Page Designer & Content Assets",
+        duration: "8 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "<strong>Page Designer</strong> is B2C Commerce's visual content management tool that lets merchandisers build and edit storefront pages without developer involvement. Developers create <strong>component types</strong> (JSON metadata + rendering templates); merchandisers assemble pages from those components in a drag-and-drop editor." },
+          { type: "heading", text: "Three Core Concepts" },
+          { type: "p", text: "<strong>Pages</strong> are top-level containers with metadata, regions, and route definitions (e.g. <code>/sale</code> or <code>/product/:productId</code>). <strong>Regions</strong> are named slots within a page or component where child components can be placed. <strong>Components</strong> are the reusable building blocks — either leaf components (render actual content) or layout components (contain regions)." },
+          { type: "callout", callout: "info", title: "Headless Page Designer", text: "For PWA Kit / headless storefronts, add arch_type: 'headless' to all metadata files. This disables ISML rendering and uses React components instead, eliminating the need to maintain parallel ISML and React implementations." },
+          { type: "heading", text: "Content Assets" },
+          { type: "p", text: "<strong>Content Assets</strong> are reusable HTML fragments managed in Business Manager under <strong>Merchant Tools > Content > Content Assets</strong>. They are referenced in ISML via <code>ContentMgr.getContent('content-asset-id')</code> and rendered with <code>&lt;isprint value='${ca.custom.body.markup}' encoding='off'/&gt;</code>. Common uses: promotional banners, legal copy, FAQ content." },
+          { type: "callout", callout: "tip", title: "Content Slots", text: "Content Slots are placeholders in templates where merchandisers can schedule content to appear. They differ from Content Assets in that slots support scheduling (show content A from Monday to Friday, then content B), A/B testing, and customer group targeting." },
+        ],
+        code: [
+          {
+            title: "Page Designer component metadata (JSON)",
+            lang: "json",
+            code: `{
+  "name": "Hero Banner",
+  "id": "hero_banner",
+  "description": "Full-width hero image with headline and CTA",
+  "group": "Banners",
+  "attribute_definition_groups": [
+    {
+      "id": "content",
+      "name": "Content",
+      "attribute_definitions": [
+        {
+          "id": "heading",
+          "name": "Heading Text",
+          "type": "string",
+          "required": true,
+          "defaultValue": "Shop New Arrivals"
+        },
+        {
+          "id": "backgroundImage",
+          "name": "Background Image",
+          "type": "image",
+          "required": true
+        },
+        {
+          "id": "ctaLink",
+          "name": "CTA URL",
+          "type": "url",
+          "required": false
+        },
+        {
+          "id": "ctaLabel",
+          "name": "CTA Label",
+          "type": "string",
+          "defaultValue": "Shop Now"
+        }
+      ]
+    }
+  ]
+}`,
+            explanation: "Component JSON defines the fields merchandisers see in the Page Designer editor. Attribute types: string, text, integer, boolean, image, url, category, product, enum."
+          },
+          {
+            title: "Page Designer component ISML template",
+            lang: "xml",
+            code: `<!--- templates/default/experience/components/banners/heroBanner.isml --->
+<isscript>
+    var assets = require('*/cartridge/scripts/assets.js');
+    assets.addCss('/css/components/hero-banner.css');
+
+    // Content is passed via pdict.content (the component's attribute values)
+    var content = pdict.content;
+</isscript>
+
+<div class="hero-banner" role="banner">
+    <isif condition="\${content.backgroundImage}">
+        <img class="hero-banner__image"
+             src="\${content.backgroundImage.absURL}"
+             alt="<isprint value='\${content.heading}' encoding='htmlcontent'/>"
+        />
+    </isif>
+
+    <div class="hero-banner__content">
+        <h1 class="hero-banner__heading">
+            <isprint value="\${content.heading}" encoding="htmlcontent"/>
+        </h1>
+
+        <isif condition="\${content.ctaLink}">
+            <a class="hero-banner__cta btn btn-primary"
+               href="\${content.ctaLink}">
+                <isprint value="\${content.ctaLabel}" encoding="htmlcontent"/>
+            </a>
+        </isif>
+    </div>
+</div>`,
+            explanation: "pdict.content contains the component's attribute values from Page Designer. File path must match: experience/components/{group}/{id}.isml."
+          },
+          {
+            title: "Reading a Content Asset in a controller",
+            lang: "javascript",
+            code: `var ContentMgr = require('dw/content/ContentMgr');
+
+function getPromoContent(contentId) {
+    var contentAsset = ContentMgr.getContent(contentId);
+
+    if (!contentAsset || !contentAsset.online) {
+        return null;
+    }
+
+    return {
+        id: contentAsset.ID,
+        name: contentAsset.name,
+        // custom.body is the HTML body field in BM
+        body: contentAsset.custom.body ? contentAsset.custom.body.markup : ''
+    };
+}
+
+// In ISML: render the body HTML
+// <isprint value="\${pdict.promoContent.body}" encoding="off"/>
+// (encoding='off' because it's trusted HTML from BM, not user input)`,
+            explanation: "ContentMgr.getContent() retrieves a content asset by its ID. Always check .online before rendering. Use encoding='off' for body markup since it's authored in Business Manager."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is the difference between a Content Asset and a Content Slot?",
+            options: [
+              "They are the same — just different names",
+              "Content Assets are static reusable HTML fragments; Content Slots support scheduling, A/B testing, and customer group targeting",
+              "Content Slots are used in ISML; Content Assets are used in Page Designer only",
+              "Content Assets are for images; Content Slots are for text"
+            ],
+            correct: 1,
+            explanation: "Content Assets are static reusable HTML fragments. Content Slots are dynamic placeholders that support scheduling (show different content at different times), customer group targeting, and A/B testing."
+          },
+          {
+            q: "What does arch_type: 'headless' do in a Page Designer metadata file?",
+            options: [
+              "Disables the component in Business Manager",
+              "Disables ISML rendering and uses React components, removing the need for parallel ISML templates",
+              "Marks the component as a layout (container) type",
+              "Enables server-side rendering for the component"
+            ],
+            correct: 1,
+            explanation: "arch_type: 'headless' tells Page Designer to use React rendering (for PWA Kit storefronts) instead of ISML. This eliminates the need to maintain both ISML and React templates."
+          },
+          {
+            q: "In Page Designer, what is a 'Region'?",
+            options: [
+              "A geographic region for content localisation",
+              "A named slot within a page or layout component where child components can be dropped",
+              "A category of components in the component library",
+              "A scheduled time window for content display"
+            ],
+            correct: 1,
+            explanation: "Regions are named container slots within pages or layout components. Merchandisers drag components into regions in the visual editor. Developers define which regions exist in the page/component JSON metadata."
+          }
+        ]
+      }
+    ]
+  },
+
+  // ── MODULE 12 ─────────────────────────────────────────────────────────────
+  {
+    id: "localization-multisite",
+    title: "Localization & Multi-Site",
+    icon: "🌍",
+    color: "#059669",
+    type: "b2c",
+    description: "Locale hierarchy, resource bundles, multi-currency, URL patterns, and multi-site architecture.",
+    lessons: [
+      {
+        id: "localization",
+        title: "Locale Hierarchy & Resource Bundles",
+        duration: "8 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "B2C Commerce organises sites hierarchically: one <strong>Organization</strong> contains multiple <strong>Sites</strong>, each with its own locale configuration. Locale IDs follow the pattern <code>language_COUNTRY</code> (e.g. <code>en_US</code>, <code>de_DE</code>, <code>fr_CA</code>). Country codes must be ISO 3166-1-alpha-2 (two characters) — using 3-letter codes will cause order export failures." },
+          { type: "heading", text: "Locale Fallback" },
+          { type: "p", text: "The fallback chain is: <strong>country-specific locale</strong> (en_US) → <strong>language locale</strong> (en) → <strong>default locale</strong>. If a translation is missing in <code>en_US</code>, it automatically inherits from <code>en</code>, then from default. This hierarchy is configurable per-locale in BM and can be disabled." },
+          { type: "callout", callout: "info", title: "Currency Handling", text: "Currency is automatically selected based on the active locale. USD displays as '$'; other currencies use prefixed symbols (e.g. 'A$' for AUD). The system includes all world currencies — no manual addition needed. Multi-currency display (showing prices in multiple currencies) is for display only and does not support multi-currency checkout." },
+          { type: "heading", text: "Resource Bundles" },
+          { type: "p", text: "The recommended approach is <strong>single template set with resource bundles</strong>. Externalize all user-facing strings into <code>.properties</code> files (one per locale), reference them via keys in templates using <code>Resource.msg('key', 'bundle', null)</code>. This is far more maintainable than maintaining separate template directories per locale." },
+          { type: "callout", callout: "warning", title: "Encoding", text: "Properties files must be UTF-8 encoded. Files using ISO-8859-1 with extended ASCII characters (accented letters, etc.) must be converted. UTF-8 is required for Asian languages, Arabic, Hebrew, Cyrillic, and other non-Latin scripts." },
+          { type: "heading", text: "URL Localisation" },
+          { type: "p", text: "Standard localised URL structure: <code>/on/demandware.store/Sites-MySite-Site/{locale}/Home-Show</code>. When the locale is configured as the first URL element (e.g. <code>/en_US/mens</code>), requests without the locale prefix (<code>/mens</code>) will NOT resolve — the locale must always be present." },
+        ],
+        code: [
+          {
+            title: "Resource bundles structure and usage",
+            lang: "text",
+            code: `// Folder structure in your cartridge:
+cartridge/templates/resources/
+├── account.properties         ← default (en fallback)
+├── account_de.properties      ← German
+├── account_de_DE.properties   ← German (Germany) — more specific
+├── account_fr.properties      ← French
+└── account_fr_CA.properties   ← French (Canada)
+
+// account.properties (default):
+account.heading=My Account
+account.welcome=Welcome, {0}!
+account.orders.empty=You have no orders yet.
+
+// account_de.properties:
+account.heading=Mein Konto
+account.welcome=Willkommen, {0}!
+account.orders.empty=Sie haben noch keine Bestellungen.`,
+            explanation: "Properties files follow the locale fallback chain. The {0} placeholder is replaced at runtime. Only override keys that differ from the parent locale — inherited keys auto-fallback."
+          },
+          {
+            title: "Using Resource.msg() in controllers and ISML",
+            lang: "javascript",
+            code: `// In a controller (server-side JS):
+var Resource = require('dw/web/Resource');
+
+// Resource.msg(key, bundle, defaultValue, ...formatArgs)
+var heading = Resource.msg('account.heading', 'account', 'My Account');
+var welcome = Resource.msgf('account.welcome', 'account', null, customer.firstName);
+// msgf() accepts format arguments for {0}, {1} placeholders
+
+res.render('account/dashboard', {
+    heading: heading,
+    welcomeMsg: welcome
+});`,
+            explanation: "Resource.msg() uses the current request locale automatically. The bundle name matches the .properties filename (without locale suffix and .properties extension)."
+          },
+          {
+            title: "ISML resource bundle usage",
+            lang: "xml",
+            code: `<!--- In ISML templates, use Resource directly --->
+<isscript>
+    var Resource = require('dw/web/Resource');
+</isscript>
+
+<h1>\${Resource.msg('account.heading', 'account', 'My Account')}</h1>
+
+<!--- Or use the shorthand syntax in ISML (imports Resource automatically) --->
+<h2>\${Resource.msg('checkout.title', 'checkout', null)}</h2>
+
+<!--- With format arguments (customer name substitution) --->
+<p>\${Resource.msgf('account.welcome', 'account', null, pdict.customer.firstName)}</p>
+
+<!--- Static files (CSS/JS) use locale folder fallback automatically --->
+<!--- URL: /on/demandware.static/Sites-MySite-Site/de_DE/-/css/main.css --->
+<!--- Falls back to /default/css/main.css if de_DE folder doesn't have it --->`,
+            explanation: "ISML resolves the locale from the current session automatically. Static assets (CSS/JS/images) in locale-specific subdirectories of cartridge/static/ also fall back to /default/."
+          },
+          {
+            title: "Multi-site configuration in Business Manager",
+            lang: "text",
+            code: `// Organization hierarchy:
+Organization
+├── Site: US-English  (locale: en_US, currency: USD)
+├── Site: UK-English  (locale: en_GB, currency: GBP)
+├── Site: Germany     (locale: de_DE, currency: EUR)
+└── Site: France      (locale: fr_FR, currency: EUR)
+
+// Each site shares the SAME:
+//   - Master catalog (product data)
+//   - Code version (cartridges)
+//   - Organization-level promotions
+
+// Each site has its OWN:
+//   - Site catalog (categories, product assignments)
+//   - Price books (per-currency pricing)
+//   - Site preferences (feature flags, API keys)
+//   - Content assets and slots
+//   - Search index
+
+// Business Manager: Administration > Sites > Manage Sites
+// Each site has its own Cartridge Path, Locale, Currency settings`,
+            explanation: "Multi-site is a first-class feature. All sites share one code version and master catalog, cutting maintenance overhead significantly. Site-specific content and pricing are isolated per site."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is the locale fallback order for a missing en_US translation?",
+            options: [
+              "en_US → default (skips en)",
+              "en_US → en → default",
+              "default → en → en_US",
+              "en_US fails with a missing key error"
+            ],
+            correct: 1,
+            explanation: "The fallback chain is: country-specific (en_US) → language (en) → default. If en_US doesn't have the key, it looks in en; if en doesn't have it, it uses the default locale."
+          },
+          {
+            q: "Why must country codes be ISO 3166-1-alpha-2 (two characters) in B2C Commerce?",
+            options: [
+              "Performance reasons — two characters is faster to index",
+              "Three-letter codes cause failures including order export failures",
+              "It is only a convention, not a strict requirement",
+              "Business Manager only has room to display two characters"
+            ],
+            correct: 1,
+            explanation: "B2C Commerce mandates two-character ISO 3166-1-alpha-2 country codes. Using three-letter codes will cause feature failures, including order export failures."
+          },
+          {
+            q: "What method do you use to get a translated string with a placeholder value (e.g. customer name)?",
+            options: [
+              "Resource.msg('key', 'bundle', null)",
+              "Resource.msgf('key', 'bundle', null, value)",
+              "Resource.format('key', value)",
+              "Resource.translate('key', {name: value})"
+            ],
+            correct: 1,
+            explanation: "Resource.msgf() is the formatted version of msg(). It accepts additional arguments that replace {0}, {1}, etc. placeholders in the properties file value."
+          }
+        ]
+      }
+    ]
+  },
+
+  // ── MODULE 13 ─────────────────────────────────────────────────────────────
+  {
+    id: "security-deployment",
+    title: "Security & Deployment",
+    icon: "🔐",
+    color: "#374151",
+    type: "b2c",
+    description: "OCAPI/SCAPI auth, OAuth scopes, XSS prevention, CSRF protection, and CI/CD deployment patterns.",
+    lessons: [
+      {
+        id: "api-security",
+        title: "API Security: OAuth, SLAS & Scopes",
+        duration: "9 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "B2C Commerce API security is built on <strong>OAuth 2.0</strong>. Two distinct auth systems exist: <strong>OCAPI</strong> (legacy) uses its own client ID + JWT/OAuth flow managed in Account Manager. <strong>SCAPI</strong> (modern) uses <strong>SLAS</strong> (Shopper Login and API Access Service) with OAuth 2.0 + PKCE for shoppers, and Client Credentials for server-to-server calls." },
+          { type: "heading", text: "SLAS Client Types" },
+          { type: "p", text: "<strong>Public clients</strong> (no secret — for PWA Kit, SFRA, mobile apps): use Authorization Code + PKCE flow. No secret is generated; the PKCE verifier proves identity. <strong>Private clients</strong> (secret-based — for BFF layers, server-to-server): use Client Credentials flow. Secrets must never be exposed in client-side code." },
+          { type: "callout", callout: "warning", title: "Least Privilege", text: "Apply the principle of least privilege when provisioning API clients. Only assign the scopes the client actually needs. Overly-broad scopes (e.g. .rw on everything) increase the blast radius if a token is compromised." },
+          { type: "heading", text: "OAuth Scopes" },
+          { type: "p", text: "Scopes control which resources a token can access. Scopes ending in <code>.rw</code> grant read+write access; scopes without <code>.rw</code> are read-only. Administrators assign <strong>Allowed Scopes</strong> (maximum a client can ever request) and <strong>Default Scopes</strong> (what tokens get if not specified) in Account Manager. SLAS handles a maximum of 30 Custom Object scopes." },
+          { type: "callout", callout: "info", title: "XSS Responsibility", text: "SCAPI returns stored data as-is — no HTML encoding or sanitisation is applied. You are responsible for encoding output when rendering API responses in HTML. Always use htmlcontent encoding in ISML or your framework's equivalent to prevent XSS." },
+          { type: "heading", text: "CSRF Protection in SFRA" },
+          { type: "p", text: "SFRA includes built-in CSRF protection via the <code>csrf</code> middleware. POST routes that modify state (add to cart, update account, checkout) must use <code>csrf.validateAjaxRequest</code> or <code>csrf.validateRequest</code>. CSRF tokens are generated per session and validated server-side on every state-changing POST." },
+        ],
+        code: [
+          {
+            title: "SLAS — getting a guest shopper token (PKCE flow)",
+            lang: "javascript",
+            code: `import { ShopperLogin } from 'commerce-sdk-isomorphic';
+
+const shopperLogin = new ShopperLogin({
+    clientId: 'my-public-client-id',      // public client — no secret
+    organizationId: 'f_ecom_zzzz_prd',
+    shortCode: 'kv7kzm78',
+    siteId: 'RefArch'
+});
+
+// Step 1: Generate PKCE verifier and challenge
+function generatePKCE() {
+    const verifier = crypto.randomBytes(32).toString('base64url');
+    const challenge = crypto.createHash('sha256')
+        .update(verifier).digest('base64url');
+    return { verifier, challenge };
+}
+
+// Step 2: Get guest token using PKCE
+async function getGuestToken() {
+    const { verifier, challenge } = generatePKCE();
+
+    const tokenResponse = await shopperLogin.getAccessToken({
+        body: {
+            grant_type: 'client_credentials',
+            code_verifier: verifier,
+            code_challenge: challenge,
+            code_challenge_method: 'S256',
+            channel_id: 'RefArch'
+        }
+    });
+
+    return tokenResponse.access_token;
+}`,
+            explanation: "Public SLAS clients use PKCE — the code_verifier proves the client that initiated the flow is the same one completing it. Never use a client secret in browser-side code."
+          },
+          {
+            title: "OCAPI Settings — authorising a client in Business Manager",
+            lang: "json",
+            code: `// Business Manager: Administration > Site Development > Open Commerce API Settings
+// Add to the Site or Global OCAPI settings JSON:
+{
+  "_v": "23.2",
+  "clients": [
+    {
+      "client_id": "my-integration-client-id",
+      "resources": [
+        {
+          "resource_id": "/orders/*",
+          "methods": ["get", "patch"],
+          "read_attributes": "(**)",
+          "write_attributes": "(**)"
+        },
+        {
+          "resource_id": "/customers/*",
+          "methods": ["get"],
+          "read_attributes": "(id,first_name,last_name,email)"
+        }
+      ]
+    }
+  ]
+}`,
+            explanation: "OCAPI authorisation is JSON-based. Each resource_id is a path pattern. read_attributes / write_attributes use glob syntax (**) for all or specific fields. Restrict to minimum required attributes."
+          },
+          {
+            title: "CSRF protection in SFRA controllers",
+            lang: "javascript",
+            code: `'use strict';
+
+var server = require('server');
+var csrf = require('*/cartridge/scripts/middleware/csrf');
+
+// AJAX POST — validates CSRF token in request header/body
+server.post('SaveAddress', server.middleware.https,
+    csrf.validateAjaxRequest,
+    function (req, res, next) {
+        // Only reaches here if CSRF token is valid
+        var addressData = req.form;
+        // ... save address logic ...
+        res.json({ success: true });
+        return next();
+    }
+);
+
+// Full-page form POST — validates CSRF from hidden form field
+server.post('UpdateProfile', server.middleware.https,
+    csrf.validateRequest,
+    function (req, res, next) {
+        // req.form contains validated POST data
+        res.redirect(URLUtils.url('Account-Show'));
+        return next();
+    }
+);
+
+// Generate CSRF token for a form (in controller sending the page):
+server.get('EditProfile', function (req, res, next) {
+    var csrfProtection = require('*/cartridge/scripts/middleware/csrf');
+    res.render('account/editProfile', {
+        csrf: { token: csrfProtection.generateToken() }
+    });
+    return next();
+});`,
+            explanation: "csrf.validateAjaxRequest reads the CSRF token from the request header (X-CSRF-Token). csrf.validateRequest reads from the form field. Always generate a token server-side and include it in your form/AJAX headers."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is the difference between a SLAS public client and a private client?",
+            options: [
+              "Public clients have more permissions; private clients are restricted",
+              "Public clients (no secret, use PKCE) are for browser/mobile apps; private clients (with secret) are for server-to-server calls",
+              "Public clients use OCAPI; private clients use SCAPI",
+              "They are identical — the distinction is deprecated"
+            ],
+            correct: 1,
+            explanation: "Public SLAS clients have no secret and use PKCE to secure the auth flow — safe for browsers and mobile apps. Private clients have a generated secret for server-to-server (BFF) flows. Never put a private client secret in browser-side code."
+          },
+          {
+            q: "SCAPI returns data without HTML encoding. What does this mean for developers?",
+            options: [
+              "Nothing — browsers handle XSS protection automatically",
+              "Developers must apply context-appropriate output encoding when rendering API responses in HTML to prevent XSS",
+              "Salesforce handles encoding server-side before responses reach developers",
+              "Only applies to user-generated content, not product data"
+            ],
+            correct: 1,
+            explanation: "SCAPI returns raw stored data. If a product name contains <script>...</script> (from a data import), rendering it unencoded in HTML would execute the script. Always encode output: htmlcontent in ISML, or your framework's escaping equivalent."
+          },
+          {
+            q: "What does a scope ending in '.rw' grant?",
+            options: [
+              "Read-only access to write-optimised endpoints",
+              "Read and write access to that resource",
+              "Restricted write access (append-only)",
+              "Access to the resource's raw database records"
+            ],
+            correct: 1,
+            explanation: "OAuth scopes ending in .rw (read-write) grant both read and write access to a resource. Scopes without .rw are read-only. Always provision the minimum scopes needed."
+          },
+          {
+            q: "What middleware protects AJAX POST routes from CSRF attacks in SFRA?",
+            options: [
+              "server.middleware.https",
+              "userLoggedIn.validateLoggedIn",
+              "csrf.validateAjaxRequest",
+              "cache.applyDefaultCache"
+            ],
+            correct: 2,
+            explanation: "csrf.validateAjaxRequest validates the CSRF token in the request header (X-CSRF-Token) for AJAX calls. csrf.validateRequest is used for full-page form POSTs that send the token as a hidden field."
+          }
+        ]
+      },
+      {
+        id: "deployment",
+        title: "Deployment & CI/CD",
+        duration: "8 min",
+        type: "b2c",
+        concept: [
+          { type: "p", text: "B2C Commerce uses a <strong>code version</strong> system for deployments. Multiple code versions can exist on an instance simultaneously; only one is active at a time. This enables zero-downtime deployments by uploading a new version, testing it, then activating it. The active code version is set in Business Manager under <strong>Administration > Code Deployment</strong>." },
+          { type: "heading", text: "sfcc-ci CLI" },
+          { type: "p", text: "<code>sfcc-ci</code> is the official Salesforce Commerce Cloud CLI for automating deployments. Key commands: <code>code:deploy</code> (upload a zip to a code version), <code>code:activate</code> (activate a code version), <code>job:run</code> (trigger a BM job), <code>data:upload</code> (upload import files). It uses OAuth 2.0 for authentication with Account Manager." },
+          { type: "callout", callout: "info", title: "dw.json", text: "The dw.json file in your project root configures sfcc-ci for local development: hostname, username, password, code-version, and cartridge list. Never commit credentials to source control — use environment variables in CI/CD pipelines instead." },
+          { type: "heading", text: "Deployment Pipeline" },
+          { type: "p", text: "A typical CI/CD pipeline: <strong>1)</strong> Run linting + unit tests, <strong>2)</strong> Zip cartridges, <strong>3)</strong> Upload to sandbox/staging via sfcc-ci, <strong>4)</strong> Activate the code version, <strong>5)</strong> Run smoke tests / integration tests, <strong>6)</strong> If passed: replicate to production. Replication (staging → production) is done via Business Manager's Staging Replication module." },
+          { type: "callout", callout: "warning", title: "Replication is One-Way", text: "Data replication from Staging to Production is destructive and one-way. Always confirm what is being replicated. A full replication will overwrite production data with staging data for the selected modules. Only replicate what has changed." },
+        ],
+        code: [
+          {
+            title: "sfcc-ci deployment pipeline (shell script)",
+            lang: "bash",
+            code: `#!/bin/bash
+# CI/CD deployment script using sfcc-ci
+
+# Authenticate with Account Manager (use env vars, never hardcode)
+sfcc-ci auth:login \\
+  --client-id "\${SFCC_CLIENT_ID}" \\
+  --client-secret "\${SFCC_CLIENT_SECRET}"
+
+# Zip all cartridges into a deployable archive
+cd ./cartridges
+zip -r ../build/cartridges.zip . -x "*.DS_Store" -x "node_modules/*"
+cd ..
+
+# Upload the zip to the target instance as a new code version
+sfcc-ci code:deploy ./build/cartridges.zip \\
+  --instance "\${SFCC_INSTANCE}" \\
+  --version "\${CODE_VERSION}"
+
+# Activate the new code version
+sfcc-ci code:activate \\
+  --version "\${CODE_VERSION}" \\
+  --instance "\${SFCC_INSTANCE}"
+
+# Trigger a post-deploy job (e.g. search index rebuild)
+sfcc-ci job:run SearchIndex \\
+  --instance "\${SFCC_INSTANCE}" \\
+  --wait
+
+echo "Deployment complete: \${CODE_VERSION} on \${SFCC_INSTANCE}"`,
+            explanation: "Use environment variables for all credentials in CI/CD. --wait on job:run blocks until the job completes, enabling pipeline gates based on job outcome."
+          },
+          {
+            title: "dw.json — local development config",
+            lang: "json",
+            code: `{
+  "hostname": "dev01-na01-yourcompany.demandware.net",
+  "username": "developer@yourcompany.com",
+  "password": "your-sandbox-password",
+  "code-version": "version1",
+  "cartridge": [
+    "app_custom_brand",
+    "app_storefront_base",
+    "modules"
+  ]
+}`,
+            explanation: "dw.json is read by sfcc-ci and VS Code Prophet Debugger for local development. Add it to .gitignore — use dw.json.example with placeholder values in source control instead."
+          }
+        ],
+        quiz: [
+          {
+            q: "What is a 'code version' in B2C Commerce?",
+            options: [
+              "A git tag on the SFCC repository",
+              "A named snapshot of all cartridges on an instance; only one is active at a time",
+              "A version number in package.json",
+              "A Business Manager configuration export"
+            ],
+            correct: 1,
+            explanation: "A code version is a named container for all cartridge code on an SFCC instance. Multiple versions can coexist; only one is active. This enables testing a new deployment before activating it."
+          },
+          {
+            q: "Why should dw.json never be committed to source control?",
+            options: [
+              "It contains sandbox hostnames which are confidential",
+              "It contains credentials (username/password) that would expose sandbox access",
+              "sfcc-ci does not support dw.json in CI/CD pipelines",
+              "It is auto-generated and changes on every deployment"
+            ],
+            correct: 1,
+            explanation: "dw.json contains a plaintext username and password. Committing it would expose sandbox credentials to anyone with repository access. Use environment variables in CI/CD and add dw.json to .gitignore."
+          },
+          {
+            q: "What does 'staging replication' do in B2C Commerce?",
+            options: [
+              "Copies code from development to staging",
+              "Copies selected data modules (catalog, content, config) from staging to production — one-way and potentially destructive",
+              "Backs up the production database to staging",
+              "Synchronises code versions between all instances"
+            ],
+            correct: 1,
+            explanation: "Staging replication copies selected data modules from staging to production. It is one-way (staging → production) and overwrites production data for the selected modules. Always review what you're replicating before executing."
+          }
+        ]
+      }
+    ]
   }
 ];
 
